@@ -5,4 +5,4 @@ app = Flask(__name__)
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {"status": "broken"}

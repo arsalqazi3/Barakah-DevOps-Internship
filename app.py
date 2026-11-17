@@ -1,11 +1,13 @@
+import os
+import secrets
 import sqlite3
 
 from flask import Flask, request
 
 app = Flask(__name__)
 
-# VULNERABLE ON PURPOSE (Task 2 demo): hardcoded secret
-app.config["SECRET_KEY"] = "barakah-demo-hardcoded-secret-123"
+# Fixed: secret comes from the environment, never from the code
+app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY") or secrets.token_hex(32)
 
 
 def get_db():
@@ -24,7 +26,8 @@ def health():
 def users():
     name = request.args.get("name", "")
     conn = get_db()
-    # VULNERABLE ON PURPOSE (Task 2 demo): SQL injection
-    query = f"SELECT id, name FROM users WHERE name = '{name}'"
-    rows = conn.execute(query).fetchall()
+    # Fixed: parameterized query, input is passed as data, not SQL
+    rows = conn.execute(
+        "SELECT id, name FROM users WHERE name = ?", (name,)
+    ).fetchall()
     return {"users": [{"id": r[0], "name": r[1]} for r in rows]}

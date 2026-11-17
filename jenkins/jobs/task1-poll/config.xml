@@ -1,7 +1,7 @@
-<?xml version="1.1" encoding="UTF-8"?>
+<?xml version='1.1' encoding='UTF-8'?>
 <project>
   <actions/>
-  <description>Barakah Task 1: polls GitHub and runs ci.sh on new commits</description>
+  <description>Barakah Tasks 1-2: polls GitHub, runs tests, then a Snyk SAST gate</description>
   <keepDependencies>false</keepDependencies>
   <properties/>
   <scm class="hudson.plugins.git.GitSCM" plugin="git@5.11.0">
@@ -33,10 +33,20 @@
   <concurrentBuild>false</concurrentBuild>
   <builders>
     <hudson.tasks.Shell>
-      <command>  bash ci.sh</command>
+      <command>  bash ci.sh
+  bash sast.sh</command>
       <configuredLocalRules/>
     </hudson.tasks.Shell>
   </builders>
   <publishers/>
-  <buildWrappers/>
+  <buildWrappers>
+    <org.jenkinsci.plugins.credentialsbinding.impl.SecretBuildWrapper plugin="credentials-binding@728.v902a_273b_8947">
+      <bindings>
+        <org.jenkinsci.plugins.credentialsbinding.impl.StringBinding>
+          <credentialsId>synk-token</credentialsId>
+          <variable>SNYK_TOKEN</variable>
+        </org.jenkinsci.plugins.credentialsbinding.impl.StringBinding>
+      </bindings>
+    </org.jenkinsci.plugins.credentialsbinding.impl.SecretBuildWrapper>
+  </buildWrappers>
 </project>

@@ -7,3 +7,6 @@ test_*.py
 requirements-dev.txt
 *.sh
 ecs
+Jenkinsfile
+.flake8
+reports

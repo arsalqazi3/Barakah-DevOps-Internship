@@ -219,3 +219,5 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 taskdef-rendered.json
+taskdef-arn.txt
+reports/

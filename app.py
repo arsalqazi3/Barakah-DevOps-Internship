@@ -19,7 +19,7 @@ def get_db():
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "version": os.environ.get("APP_VERSION", "dev")}
 
 
 @app.get("/users")

@@ -8,6 +8,7 @@ All tasks build on one small Flask app, so each task adds a new stage to the sam
 |---|---|
 | Task 1: Jenkins Server Setup via Docker | `task-1-jenkins` |
 | Task 2: Code Quality & Security Scanning (SAST) | `task-2-sast` |
+| Task 3: Docker Image CI/CD to ECR | `task-3-ecr` |
 
 ---
 
@@ -166,3 +167,89 @@ app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY") or secrets.token_hex(32)
 ```
 
 In production the real key would come from a secret manager such as AWS Secrets Manager, and a secret that was ever committed should be rotated, since it stays in Git history.
+
+---
+
+## Task 3: Docker Image CI/CD to ECR
+
+**Goal:** Build a Docker image of the backend app in the pipeline, tag it with the Git commit hash, and push it to Amazon Elastic Container Registry (ECR).
+
+Pipeline now: **poll GitHub → checkout → unit tests → SAST gate → build image → push to ECR**
+
+An image is only built and pushed if the tests and the security scan both pass, so a vulnerable build never reaches the registry.
+
+### The app image
+
+[`Dockerfile`](Dockerfile):
+
+- `python:3.12-slim` base, to keep the image small with fewer packages that could have vulnerabilities
+- Served with **gunicorn**, a production server (Flask's built-in server is for development only)
+- Runs as a **non-root user** (`appuser`)
+- A `HEALTHCHECK` on `/health`, so Docker and ECS can tell when the app is unhealthy
+- Test tools are kept out of the image: `requirements.txt` has only runtime packages, `requirements-dev.txt` adds pytest for CI, and [`.dockerignore`](.dockerignore) leaves out tests, docs and `.git`
+
+### How Jenkins builds and pushes
+
+- **Docker CLI** is added to the Jenkins image ([`jenkins/Dockerfile`](jenkins/Dockerfile)), and [`jenkins/run.sh`](jenkins/run.sh) mounts the host's `/var/run/docker.sock`. Jenkins sends build commands to the EC2 host's Docker, so it doesn't run its own Docker daemon.
+- **AWS CLI v2** is added to the Jenkins image to get the ECR login token.
+- **No AWS access keys anywhere.** The EC2 instance has an IAM role (`barakah-jenkins-ec2-role`), and AWS hands out short-lived credentials that rotate on their own. The instance metadata hop limit is set to 2 so the Jenkins container can reach them, with IMDSv2 required.
+- **Least privilege:** the role's policy only allows `ecr:GetAuthorizationToken` plus the push actions on the `barakah-app` repository. It can't touch anything else in the account.
+
+[`push-ecr.sh`](push-ecr.sh) does the work:
+
+1. Looks up the account ID from the role, so nothing is hardcoded
+2. Tags the image with the short Git commit hash (`git rev-parse --short=7 HEAD`)
+3. Skips the push if that tag is already in ECR
+4. Builds the image, logs in to ECR, and pushes it
+5. Logs out and deletes the local image, so no login token stays on disk and old images don't fill up the instance
+
+### ECR repository settings
+
+- **Private** repository `barakah-app` in `us-east-1`
+- **Immutable tags:** a tag like `0db5fb6` always points to exactly that commit and can't be overwritten. That's also why the script checks for an existing tag first, so running the pipeline again on the same commit doesn't fail.
+
+### Proof it works
+
+**1. After tests and SAST pass, the image is built and tagged with the commit hash:**
+
+![Build and tag](docs/task-3/01-build-and-tag.png)
+
+**2. The image is pushed to ECR, then the login and local image are cleaned up:**
+
+![Push success](docs/task-3/02-push-success.png)
+
+**3. The image in ECR, tagged `0db5fb6`, the same as commit [`0db5fb6`](https://github.com/arsalqazi3/Barakah-DevOps-Internship/commit/0db5fb660ab9370d0ae56e529888ef1016c8d001):**
+
+![Image in ECR](docs/task-3/03-ecr-image.png)
+
+The two untagged entries next to it are normal. Docker's BuildKit pushes an **image index** that points to the real **image** plus a small **attestation** (build provenance record). Only the index carries the tag.
+
+### Trade-offs
+
+- **Docker socket access** is basically root on the host. It's acceptable here because only my IP can reach Jenkins, but bigger setups use separate build agents or rootless builders like Kaniko or Buildah.
+- **Login token on disk:** `docker login` writes the ECR token to `~/.docker/config.json` unencrypted. The script logs out right after the push, and the token expires after 12 hours anyway. A credential helper like `amazon-ecr-credential-helper` would avoid writing it at all.
+
+### AI Edge: authenticating Docker to ECR with the AWS CLI
+
+ECR doesn't use a fixed username and password. You ask AWS for a temporary token, which lasts 12 hours, and hand it to Docker:
+
+```bash
+# 1. Find the account ID (works with any credentials, including an EC2 role)
+ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+REGISTRY="$ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com"
+
+# 2. Get a token and log Docker in. The username is always "AWS".
+aws ecr get-login-password --region us-east-1 \
+  | docker login --username AWS --password-stdin "$REGISTRY"
+
+# 3. Tag and push
+docker tag barakah-app:latest "$REGISTRY/barakah-app:<commit-hash>"
+docker push "$REGISTRY/barakah-app:<commit-hash>"
+
+# 4. Clean up the stored login
+docker logout "$REGISTRY"
+```
+
+- `--password-stdin` pipes the token in, so it never shows up in the process list or shell history.
+- The caller needs `ecr:GetAuthorizationToken` for the login, plus push permissions on the repository.
+- The old `aws ecr get-login` command from AWS CLI v1 has been removed. `get-login-password` is the current way.

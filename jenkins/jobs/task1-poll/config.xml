@@ -1,7 +1,7 @@
 <?xml version='1.1' encoding='UTF-8'?>
 <project>
   <actions/>
-  <description>Barakah Tasks 1-2: polls GitHub, runs tests, then a Snyk SAST gate</description>
+  <description>Barakah Tasks 1-3: poll GitHub, tests, Snyk SAST gate, build and push image to ECR</description>
   <keepDependencies>false</keepDependencies>
   <properties/>
   <scm class="hudson.plugins.git.GitSCM" plugin="git@5.11.0">
@@ -34,7 +34,8 @@
   <builders>
     <hudson.tasks.Shell>
       <command>  bash ci.sh
-  bash sast.sh</command>
+  bash sast.sh
+  bash push-ecr.sh</command>
       <configuredLocalRules/>
     </hudson.tasks.Shell>
   </builders>

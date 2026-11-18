@@ -9,6 +9,7 @@ All tasks build on one small Flask app, so each task adds a new stage to the sam
 | Task 1: Jenkins Server Setup via Docker | `task-1-jenkins` |
 | Task 2: Code Quality & Security Scanning (SAST) | `task-2-sast` |
 | Task 3: Docker Image CI/CD to ECR | `task-3-ecr` |
+| Task 6: Automated Container Deployment to ECS | `task-6-ecs` |
 
 ---
 
@@ -253,3 +254,96 @@ docker logout "$REGISTRY"
 - `--password-stdin` pipes the token in, so it never shows up in the process list or shell history.
 - The caller needs `ecr:GetAuthorizationToken` for the login, plus push permissions on the repository.
 - The old `aws ecr get-login` command from AWS CLI v1 has been removed. `get-login-password` is the current way.
+
+---
+
+## Task 6: Automated Container Deployment to ECS
+
+**Goal:** Extend the ECR pipeline so that once a new image is pushed, it automatically updates the Amazon ECS task definition and forces a rolling update of the running app.
+
+Pipeline now: **poll GitHub → checkout → unit tests → SAST gate → build and push image to ECR → register new task definition → rolling update on ECS**
+
+One `git push` to `main` takes new code all the way to a running container, with no manual steps.
+
+### ECS setup
+
+- **Cluster** `barakah-cluster` running on **Fargate**, so AWS runs the containers and there are no extra servers to manage
+- **Service** `barakah-app-svc` keeps 1 task running (0.25 vCPU, 512 MB)
+- **Task definition** `barakah-app`, kept in the repo as [`ecs/task-definition.json`](ecs/task-definition.json):
+  - pulls the image from ECR using the `ecsTaskExecutionRole` (managed policy `AmazonECSTaskExecutionRolePolicy`)
+  - sends logs to CloudWatch (`/ecs/barakah-app`, kept 7 days)
+  - has a container health check on `/health`
+  - sets `APP_VERSION` to the commit hash, which `/health` returns, so you can see which version is live
+- **Network:** the task gets a public IP, and its security group only allows port 8000 from my IP. There's no load balancer, to keep costs down.
+
+### Rolling update settings
+
+- **`minimumHealthyPercent=100`, `maximumPercent=200`:** ECS starts the new task first, waits until it's healthy, and only then stops the old one. The app is never down during a deploy.
+- **Deployment circuit breaker with rollback:** if the new version keeps failing its health check, ECS stops the rollout and goes back to the last working revision on its own.
+
+### How the pipeline deploys
+
+[`deploy-ecs.sh`](deploy-ecs.sh) runs after the image is pushed:
+
+1. Builds the image URI with the same commit hash tag as Task 3
+2. Runs [`ecs/render_taskdef.py`](ecs/render_taskdef.py) to put that image URI and `APP_VERSION` into a copy of the task definition JSON
+3. Registers it as a new revision (`barakah-app:1` → `barakah-app:2` → ...)
+4. Calls `update-service` with the new revision, which starts the rolling update
+5. Waits for the service to become stable
+6. Checks that the service is really running the **new** revision. If the circuit breaker rolled back, the service is stable but on the old revision, so the script fails the build instead of reporting a false success.
+
+**Permissions:** the Jenkins EC2 role got a second inline policy, `ecs-deploy-barakah-app`. It can register task definitions, update and describe only the `barakah-app-svc` service, and pass only `ecsTaskExecutionRole`, and only to ECS tasks (`iam:PassedToService`). That condition blocks a common privilege escalation where a role passes a more powerful role to some other service.
+
+### Proof it works
+
+**1. Before: the first version, deployed by hand, with no version field yet:**
+
+![Before deploy](docs/task-6/01-app-before-deploy.png)
+
+**2. A push to `main` ran the whole pipeline, registered `barakah-app:2` and rolled it out:**
+
+![Pipeline deploy](docs/task-6/02-pipeline-deploy.png)
+
+**3. ECS shows the deployment as successful, with 0 failed tasks for the circuit breaker:**
+
+![ECS deployment](docs/task-6/03-ecs-deployment.png)
+
+**4. Service events show the rolling update: the new task started (20:35), then the old task stopped (20:36), then the service reached a steady state (20:38):**
+
+![ECS events](docs/task-6/04-ecs-events.png)
+
+**5. Each deploy creates a new task definition revision:**
+
+![Task definition revisions](docs/task-6/05-taskdef-revisions.png)
+
+**6. After: the live app returns the new commit hash:**
+
+![After deploy](docs/task-6/06-app-after-deploy.png)
+
+### Cost control
+
+When I'm not demoing, the service is scaled to 0 tasks, so nothing runs and nothing is billed for Fargate:
+
+```bash
+aws ecs update-service --cluster barakah-cluster --service barakah-app-svc --desired-count 0
+```
+
+Set it back to `1` to bring the app up again.
+
+### AI Edge: a script that updates the image URI in a task definition JSON
+
+[`ecs/render_taskdef.py`](ecs/render_taskdef.py) takes a task definition JSON file, a container name and a new image URI, and writes an updated copy:
+
+```bash
+python3 ecs/render_taskdef.py ecs/task-definition.json taskdef-rendered.json \
+  barakah-app 596319332689.dkr.ecr.us-east-1.amazonaws.com/barakah-app:02f4158
+```
+
+What it does:
+
+- Finds the container by **name**, not by position, so it still works if the task gets a sidecar container later
+- Replaces its `image` and sets `APP_VERSION` to the tag
+- Removes read-only fields that AWS adds (`taskDefinitionArn`, `revision`, `status`, `registeredAt` and so on). This means it also works on JSON from `aws ecs describe-task-definition`, which otherwise can't be registered again as-is.
+- Fails loudly if the container name isn't found, so a typo can't silently deploy nothing
+
+Keeping the task definition in Git means every change to CPU, memory, ports or environment is reviewed and versioned like code, and the pipeline only ever changes the image.

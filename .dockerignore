@@ -1,0 +1,8 @@
+.git
+.venv
+docs
+jenkins
+*.md
+test_*.py
+requirements-dev.txt
+*.sh

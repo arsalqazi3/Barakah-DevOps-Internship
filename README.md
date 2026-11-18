@@ -10,6 +10,7 @@ All tasks build on one small Flask app, so each task adds a new stage to the sam
 | Task 2: Code Quality & Security Scanning (SAST) | `task-2-sast` |
 | Task 3: Docker Image CI/CD to ECR | `task-3-ecr` |
 | Task 6: Automated Container Deployment to ECS | `task-6-ecs` |
+| Task 8: Comprehensive Enterprise Jenkins Pipeline | `task-8-pipeline` |
 
 ---
 
@@ -347,3 +348,102 @@ What it does:
 - Fails loudly if the container name isn't found, so a typo can't silently deploy nothing
 
 Keeping the task definition in Git means every change to CPU, memory, ports or environment is reviewed and versioned like code, and the pipeline only ever changes the image.
+
+---
+
+## Task 8: Comprehensive Enterprise Jenkins Pipeline
+
+**Goal:** Write a complete declarative `Jenkinsfile` with Checkout, Linting, Unit Tests, SAST Scanning, Docker Build, Push to Registry, and a deployment to staging that needs a manual approval click before it goes to production.
+
+### From clicks to code
+
+Tasks 1 to 6 ran in a Freestyle job (`task1-poll`) set up through the Jenkins UI. For Task 8 the whole pipeline moved into a [`Jenkinsfile`](Jenkinsfile) in the repo, run by a new Pipeline job, `barakah-pipeline` ("Pipeline script from SCM"). Every change to the pipeline is now reviewed and versioned like the app code. The old Freestyle job is disabled, so the two jobs don't deploy at the same time, but its build history is kept.
+
+### The stages
+
+| Stage | What it does |
+|---|---|
+| **Checkout** | `checkout scm`, then works out the short commit hash, the AWS account ID and the full image URI |
+| **Lint** | creates the venv and runs **flake8** (settings in [`.flake8`](.flake8)) |
+| **Unit Tests** | runs pytest and publishes a JUnit report, so Jenkins shows test results as a report, not just log text |
+| **SAST Scan** | Snyk Code (Task 2), with the token given only to this stage through `withCredentials` |
+| **Docker Build** | builds the app image, tagged with the commit hash (Task 3) |
+| **Push to Registry** | logs in to ECR and pushes, skipping the push if that tag already exists |
+| **Deploy to Staging** | `deploy-ecs.sh barakah-app-staging` registers a new task definition revision and rolls it out to the staging ECS service |
+| **Approve Production** | pauses with an `input` step. Only `admin` can approve, and it times out after 30 minutes |
+| **Deploy to Production** | `deploy-ecs.sh barakah-app-svc <same revision>` rolls out the **exact revision staging ran** |
+
+Pipeline options: `pollSCM('H/2 * * * *')` in the file itself, `disableConcurrentBuilds()` so two pushes can't deploy over each other, `timestamps()` for timed logs, and `buildDiscarder` to keep only the last 20 builds.
+
+### Staging and production
+
+- Two ECS Fargate services in the same cluster: **`barakah-app-staging`** (new) and **`barakah-app-svc`** (production, from Task 6). Both use rolling updates with the circuit breaker and automatic rollback.
+- **Build once, deploy many:** the image is built and the task definition is registered only once, during the staging deploy. [`deploy-ecs.sh`](deploy-ecs.sh) saves the revision ARN, and production reuses it. Production never gets a rebuilt or slightly different artifact, only what was already running in staging.
+- The Jenkins EC2 role's deploy policy now covers both services, and nothing else.
+
+### Proof it works
+
+**1. All stages passed, from Checkout through the approval to the production deploy:**
+
+![Stage view](docs/task-8/01-stage-view.png)
+
+**2. The pipeline paused after staging and waited for a manual decision:**
+
+![Approval prompt](docs/task-8/02-approval-prompt.png)
+
+**3. Jenkins records who approved the release, plus the tested commit and test results:**
+
+![Approved by admin](docs/task-8/03-approved-by-admin.png)
+
+**4 and 5. Staging and production, two separate services, both running commit `ba036cb`:**
+
+![Staging health](docs/task-8/04-staging-health.png)
+
+![Production health](docs/task-8/05-production-health.png)
+
+### What happens if nobody approves
+
+If no one clicks within 30 minutes, or someone clicks **Abort**, the build ends as **aborted**. Staging keeps the new version for more testing, and production stays exactly as it was.
+
+### Lesson learned
+
+The first time, the approve link in the console log didn't respond, because the page had been open a long time and its security token (CSRF crumb) had gone stale. Opening the build's **Paused for Input** page (`/job/barakah-pipeline/<build>/input/`) gave fresh buttons that worked right away.
+
+### Trade-off
+
+The `input` step runs inside the top-level `agent any`, so the build holds a Jenkins executor while it waits. That's fine on a single-node setup with two executors. On a busy shared Jenkins, the approval stage would use `agent none` so waiting builds don't tie up executors.
+
+### AI Edge: Groovy syntax for an `input` step
+
+The approval stage from the [`Jenkinsfile`](Jenkinsfile):
+
+```groovy
+stage('Approve Production') {
+    steps {
+        timeout(time: 30, unit: 'MINUTES') {
+            input message: "Deploy ${env.IMAGE_TAG} to production?",
+                  ok: 'Deploy to Production',
+                  submitter: 'admin'
+        }
+    }
+}
+```
+
+- **`input`** pauses the pipeline and shows **Proceed** and **Abort** buttons. `message` is the question, and `ok` renames the Proceed button.
+- **`submitter`** limits who can approve, as a comma-separated list of users or groups. Anyone else sees the prompt but can't approve it.
+- **`timeout`** around it makes sure a forgotten approval doesn't hang forever. When time runs out, the build is aborted.
+- **Collecting extra input:** `parameters` adds fields to the prompt, and the step returns what was entered:
+
+```groovy
+script {
+    def answer = input message: 'Release to production?',
+                       ok: 'Release',
+                       submitter: 'admin,release-managers',
+                       parameters: [string(name: 'CHANGE_TICKET', description: 'Change request number')]
+    echo "Approved with change ticket ${answer}"
+}
+```
+
+- **Declarative stage-level version:** an `input { }` block directly inside a `stage` (next to `agent` and `steps`). With `agent none` on that stage, the prompt doesn't hold an executor while it waits.
+
+In regulated fields like finance, this gate, together with Jenkins' record of who approved which commit, is part of the change-control audit trail.
